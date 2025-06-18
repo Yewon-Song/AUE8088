@@ -28,13 +28,17 @@ from tqdm import tqdm
 
 from utils.augmentations import (
     Albumentations,
+    rgbt_Albumentations,
     augment_hsv,
+    rgbt_augment_hsv,
     classify_albumentations,
     classify_transforms,
     copy_paste,
     letterbox,
     mixup,
     random_perspective,
+    rgbt_copy_paste,
+    rgbt_random_perspective
 )
 from utils.general import (
     DATASETS_DIR,
@@ -565,6 +569,7 @@ class LoadImagesAndLabels(Dataset):
         self.stride = stride
         self.path = path
         self.albumentations = Albumentations(size=img_size) if augment else None
+        self.rgbt_albumentations = rgbt_Albumentations(size=img_size) if augment else None
 
         try:
             f = []  # image files
@@ -780,14 +785,24 @@ class LoadImagesAndLabels(Dataset):
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp["mosaic"]
-        if mosaic:
-            # Load mosaic
-            img, labels = self.load_mosaic(index)
-            shapes = None
 
-            # MixUp augmentation
-            if random.random() < hyp["mixup"]:
-                img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+        # 👇 choice = 4 or 9
+        mosaic9 = mosaic and random.random() < hyp.get("mosaic9", 0.5)   # 9장 확률(0~1)
+        if mosaic:
+            if mosaic9:
+                img, labels = self.load_mosaic9(index)
+            else:
+                img, labels = self.load_mosaic(index)
+
+        # mosaic = self.mosaic and random.random() < hyp["mosaic"]
+        # if mosaic:
+        #     # Load mosaic
+        #     img, labels = self.load_mosaic(index)
+        #     shapes = None
+
+        #     # MixUp augmentation
+        #     if random.random() < hyp["mixup"]:
+        #         img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
 
         else:
             # Load image
@@ -1095,7 +1110,7 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
         super().__init__(path, **kwargs)
 
         # TODO: make mosaic augmentation work
-        self.mosaic = False
+        # self.mosaic = False
 
         # Set ignore flag
         cond = self.ignore_settings['train' if is_train else 'test']
@@ -1199,28 +1214,47 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp["mosaic"]
+        # if mosaic:
+        #     # raise NotImplementedError('Please make "mosaic" augmentation work!')
+
+        #     # TODO: Load mosaic
+        #     img, labels = self.load_mosaic(index)
+        #     shapes = None
+
+        #     # TODO: MixUp augmentation
+        #     if random.random() < hyp["mixup"]:
+        #         img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+
         if mosaic:
-            raise NotImplementedError('Please make "mosaic" augmentation work!')
+            # Mosaic + perspective 완료된 이미지들 + 라벨 반환됨
+            imgs, labels = self.load_mosaic9(hyp, index)
 
-            # TODO: Load mosaic
-            img, labels = self.load_mosaic(index)
-            shapes = None
-
-            # TODO: MixUp augmentation
             if random.random() < hyp["mixup"]:
-                img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+                imgs, labels = mixup(imgs, labels, *self.load_mosaic9(hyp, random.choice(self.indices)))
+
+            h, w = imgs[0].shape[:2]
+            for i in range(2):
+                # Convert
+                imgs[i] = imgs[i].transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+                imgs[i] = np.ascontiguousarray(imgs[i])
+                imgs[i] = torch.from_numpy(imgs[i])
+                
+            nl = len(labels)  # update after albumentations
+            labels_out = torch.zeros((nl, 7))
+
+            if nl:
+                labels_out[:, 1:] = torch.from_numpy(labels)
+            shapes =  ((h, w), ((1.0, 1.0), (0.0, 64.0)))
 
         else:
             # Load image
             # hw0s: original shapes, hw1s: resized shapes
             imgs, hw0s, hw1s = self.load_image(index)
-
             for ii, (img, (h0, w0), (h, w)) in enumerate(zip(imgs, hw0s, hw1s)):
                 # Letterbox
                 shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
                 img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
                 shapes = (h0, w0), (ratio, pad)  # for COCO mAP rescaling
-
                 labels = self.labels[index].copy()
                 if labels.size:  # normalized xywh to pixel xyxy format
                     labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
@@ -1315,7 +1349,173 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
         return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
 
+    def load_mosaic(self, hyp, index):
+        """Loads a 4-image mosaic for each modality (e.g., RGB and LWIR), combining 1 selected and 3 random images."""
+        labels4, segments4 = [], []
+        s = self.img_size
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
+        indices = [index] + random.choices(self.indices, k=3)
+        random.shuffle(indices)
 
+        # Initialize empty mosaic images for each modality
+        num_modalities = len(self.modalities)
+
+        for i, index in enumerate(indices):
+            imgs, ((h0,w0), _), ((h,w), _) = self.load_image(index)  # imgs: list of modality images
+            # Determine mosaic coordinates
+            if i == 0:  # top left
+                img4s = [np.full((s * 2, s * 2, 3), 114, dtype=np.uint8) for _ in range(num_modalities)]
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+            elif i == 1:  # top right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:  # bottom left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            elif i == 3:  # bottom right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+
+            # Place each modality image into corresponding img4
+            for m, img in enumerate(imgs):
+                img4s[m][y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
+
+            padw = x1a - x1b
+            padh = y1a - y1b
+
+            # Labels
+            labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            if labels.size:
+                labels[:, 1:3] += labels[:, 3:5] / 2.0
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)
+                segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
+            labels4.append(labels)
+            segments4.extend(segments)
+
+        # Concat and clip
+        labels4 = np.concatenate(labels4, 0)
+        for x in (labels4[:, 1:], *segments4):
+            np.clip(x, 0, 2 * s, out=x)
+
+        # Apply copy-paste to all modalities
+        img_lwir, img_rgb, labels4, segments4 = rgbt_copy_paste(img4s[0], img4s[1], labels4, segments4, p=self.hyp["copy_paste"])
+
+        # Apply random_perspective to all modalities with the same labels and segments
+        img_lwir, img_rgb, labels4 = rgbt_random_perspective(
+            img_lwir,
+            img_rgb,
+            labels4,  # label은 RGB 기준 하나로 보정되어 있으므로 공유
+            segments4,
+            degrees=self.hyp["degrees"],
+            translate=self.hyp["translate"],
+            scale=self.hyp["scale"],
+            shear=self.hyp["shear"],
+            perspective=self.hyp["perspective"],
+            border=self.mosaic_border,
+        )
+
+        labels4[:, 1:5] = xyxy2xywhn(labels4[:, 1:5], s, s, clip=True, eps=1e-3)
+        
+        return [img_lwir, img_rgb], labels4  # img4s: [rgb_mosaic, lwir_mosaic]
+
+    def load_mosaic9(self, hyp, index):
+        """Loads 1 image + 8 random images into a 9-image mosaic for augmented YOLOv5 training, returning labels and
+        segments.
+        """
+        labels9, segments9 = [], []
+        s = self.img_size
+        indices = [index] + random.choices(self.indices, k=8)  # 8 additional image indices
+        random.shuffle(indices)
+        hp, wp = -1, -1  # height, width previous
+
+        num_modalities = len(self.modalities)
+
+        for i, index in enumerate(indices):
+            # Load image
+            imgs, ((h0,w0), _), ((h,w), _) = self.load_image(index)
+
+            # place img in img9
+            if i == 0:  # center
+                img9 = [np.full((s * 3, s * 3, 3), 114, dtype=np.uint8) for _ in range(num_modalities)]  # base image with 4 tiles
+                h0, w0 = h, w
+                c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax (base) coordinates
+            elif i == 1:  # top
+                c = s, s - h, s + w, s
+            elif i == 2:  # top right
+                c = s + wp, s - h, s + wp + w, s
+            elif i == 3:  # right
+                c = s + w0, s, s + w0 + w, s + h
+            elif i == 4:  # bottom right
+                c = s + w0, s + hp, s + w0 + w, s + hp + h
+            elif i == 5:  # bottom
+                c = s + w0 - w, s + h0, s + w0, s + h0 + h
+            elif i == 6:  # bottom left
+                c = s + w0 - wp - w, s + h0, s + w0 - wp, s + h0 + h
+            elif i == 7:  # left
+                c = s - w, s + h0 - h, s, s + h0
+            elif i == 8:  # top left
+                c = s - w, s + h0 - hp - h, s, s + h0 - hp
+
+            padx, pady = c[:2]
+            x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coords
+
+            # Labels
+            labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            if labels.size:
+                labels[:, 1:3] += labels[:, 3:5] / 2.0
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padx, pady)  # normalized xywh to pixel xyxy format
+                segments = [xyn2xy(x, w, h, padx, pady) for x in segments]
+            labels9.append(labels)
+            segments9.extend(segments)
+
+            # Image
+            for m, img in enumerate(imgs):
+                img9[m][y1:y2, x1:x2] = img[y1 - pady :, x1 - padx :]  # img9[ymin:ymax, xmin:xmax]
+                hp, wp = h, w  # height, width previous
+
+        # Offset
+        yc, xc = (int(random.uniform(0, s)) for _ in self.mosaic_border)  # mosaic center x, y
+        for i in range(num_modalities):
+            img9[i] = img9[i][yc : yc + 2 * s, xc : xc + 2 * s]
+
+        # Concat/clip labels
+        labels9 = np.concatenate(labels9, 0)
+        labels9[:, [1, 3]] -= xc
+        labels9[:, [2, 4]] -= yc
+        c = np.array([xc, yc])  # centers
+        segments9 = [x - c for x in segments9]
+
+        for x in (labels9[:, 1:], *segments9):
+            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+        # img9, labels9 = replicate(img9, labels9)  # replicate
+
+        img_lwir, img_rgb, labels9 = self.rgbt_albumentations(img9[0], img9[1], labels9)
+
+        # rgbt_augment_hsv(img9, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+        augment_hsv(img_rgb, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+
+        # Apply copy-paste to all modalities
+        img_lwir, img_rgb, labels9, segments9 = rgbt_copy_paste(img_lwir, img_rgb, labels9, segments9, p=self.hyp["copy_paste"])
+
+        # Apply random_perspective to all modalities with the same labels and segments
+        img_lwir, img_rgb, labels9 = rgbt_random_perspective(
+            img_lwir,
+            img_rgb,
+            labels9,
+            segments9,
+            degrees=self.hyp["degrees"],
+            translate=self.hyp["translate"],
+            scale=self.hyp["scale"],
+            shear=self.hyp["shear"],
+            perspective=self.hyp["perspective"],
+            border=self.mosaic_border,
+        )
+
+        labels9[:, 1:5] = xyxy2xywhn(labels9[:, 1:5], s, s, clip=True, eps=1e-3)
+        
+        return [img_lwir, img_rgb], labels9 
+    
     @staticmethod
     def collate_fn(batch):
         """Batches images, labels, paths, shapes, and indices assigning unique indices to targets in merged label tensor."""

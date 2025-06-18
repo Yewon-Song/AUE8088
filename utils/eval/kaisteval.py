@@ -634,8 +634,8 @@ def evaluate(test_annotation_file: str, user_submission_file: str, phase_codenam
     # metrics['MR_-2_iou75_day'] = MR_day[2]
 
     print('')
-    # eval_result['night'].params.imgIds = imgIds[1455:]
-    eval_result['day'].params.imgIds = [ii for ii, img in kaistGt.imgs.items() if get_time_of_day(img['im_name']) == 'night']
+    eval_result['night'].params.imgIds = imgIds[1455:]
+    #eval_result['night'].params.imgIds = [ii for ii, img in kaistGt.imgs.items() if get_time_of_day(img['im_name']) == 'night']
     eval_result['night'].evaluate(0)
     eval_result['night'].accumulate()
     MR_night = eval_result['night'].summarize(0, subsetStr='Night')
@@ -694,18 +694,20 @@ def draw_all(eval_results, filename='figure.jpg'):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='eval models')
-    parser.add_argument('--annFile', type=str, default='evaluation_script/KAIST_annotation.json',
+    parser.add_argument('--annFile', type=str, default='/home/yewon/project/AUE8088/utils/KAIST_val-D_annotation.json',
                         help='Please put the path of the annotation file. Only support json format.')
-    parser.add_argument('--rstFiles', type=str, nargs='+', default=['evaluation_script/MLPD_result.json'],
+    parser.add_argument('--rstFiles', type=str, nargs='+', default=['/home/yewon/project/AUE8088/runs/val/yolov5n-rgbt-hate4/best_predictions.json',
+                                                                    '/home/yewon/project/AUE8088/runs/val/yolov5n-rgbt-hate33/best_predictions.json',
+                                                                    '/home/yewon/project/AUE8088/runs/val/yolov5n-rgbt-hate7/best_predictions.json',
+                                                                    '/home/yewon/project/AUE8088/runs/val/yolov5n-rgbt-hate72/best_predictions.json'],
                         help='Please put the path of the result file. Only support json, txt format.')
-    parser.add_argument('--evalFig', type=str, default=None,
+    parser.add_argument('--evalFig', type=str, default='/home/yewon/project/AUE8088/results/fppi.jpg',
                         help='Please put the output path of the Miss rate versus false positive per-image (FPPI) curve')
     args = parser.parse_args()
 
     phase = "Multispectral"
     results = [evaluate(args.annFile, rstFile, phase) for rstFile in args.rstFiles]
 
-    # Sort results by MR_all
-    if args.evalFig is not None:
-        results = sorted(results, key=lambda x: x['all'].summarize(0), reverse=True)
+if args.evalFig is not None:
+        # results = sorted(results, key=lambda x: x['all'].summarize(0), reverse=True)
         draw_all(results, filename=args.evalFig)

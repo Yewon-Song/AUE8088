@@ -195,7 +195,7 @@ def train(hyp, opt, device, callbacks):
         prefix=colorstr("train: "),
         shuffle=True,
         seed=opt.seed,
-        rgbt_input=opt.rgbt,
+        rgbt_input=opt.rgbt
     )
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
@@ -265,12 +265,20 @@ def train(hyp, opt, device, callbacks):
         pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
 
+        import os
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+
+
+        os.makedirs(save_dir, exist_ok=True)
+
         for i, (imgs, targets, paths, _, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
 
             if isinstance(imgs, list):
                 imgs = [img.to(device, non_blocking=True).float() / 255 for img in imgs]    # For RGB-T input
+                # imgs = torch.cat(imgs, dim=1) # !!
             else:
                 imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 

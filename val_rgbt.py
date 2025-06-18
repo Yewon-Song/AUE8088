@@ -1,23 +1,16 @@
 # YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
 """
-Validate a trained YOLOv5 detection model on a detection dataset.
+Validate a trained YOLOv5 detection model on a detection dataset with RGB-T support.
 
 Usage:
-    $ python val.py --weights yolov5s.pt --data coco128.yaml --img 640
+    $ python val_rgbt.py --weights yolov5s.pt --data coco128.yaml --img 640
+    $ python val_rgbt.py --weights best.pt --data kaist-rgbt.yaml --rgbt --task test --save-json
 
-Usage - formats:
-    $ python val.py --weights yolov5s.pt                 # PyTorch
-                              yolov5s.torchscript        # TorchScript
-                              yolov5s.onnx               # ONNX Runtime or OpenCV DNN with --dnn
-                              yolov5s_openvino_model     # OpenVINO
-                              yolov5s.engine             # TensorRT
-                              yolov5s.mlmodel            # CoreML (macOS-only)
-                              yolov5s_saved_model        # TensorFlow SavedModel
-                              yolov5s.pb                 # TensorFlow GraphDef
-                              yolov5s.tflite             # TensorFlow Lite
-                              yolov5s_edgetpu.tflite     # TensorFlow Edge TPU
-                              yolov5s_paddle_model       # PaddlePaddle
-"""
+RGB-T Usage:
+    $ python val_rgbt.py --weights runs/train/yolov5s_nc4/weights/best.pt --data data/kaist-rgbt-fold1.yaml --rgbt --task test --save-json --single-cls --device 1
+아래 그대로 실행하면됨.
+    python3 val_rgbt.py --weights runs/train/yolov5n-rgbt-mosaic2/weights/best.pt --data data/kaist-rgbt.yaml --rgbt --task test --save-json  --device 1
+    """
 
 import argparse
 import json
@@ -69,27 +62,49 @@ def save_one_txt(predn, save_conf, shape, file):
             f.write(("%g " * len(line)).rstrip() % line + "\n")
 
 
-def save_one_json(predn, jdict, path, index, class_map):
+# def save_one_json(predn, jdict, path, index, class_map):
+#     """
+#     Saves one JSON detection result with image ID, category ID, bounding box, and score.
+
+#     Example: {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
+#     """
+#     image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+#     box = xyxy2xywh(predn[:, :4])  # xywh
+#     box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+#     for p, b in zip(predn.tolist(), box.tolist()):
+#         if p[4] < 0.1:
+#             continue
+#         jdict.append(
+#             {
+#                 "image_name": image_id,
+#                 "image_id": int(index),
+#                 "category_id": class_map[int(p[5])],
+#                 "bbox": [round(x, 3) for x in b],
+#                 "score": round(p[4], 5),
+#             }
+#         )
+
+def save_one_json(predn, jdict, image_path, image_id, class_map):
     """
     Saves one JSON detection result with image ID, category ID, bounding box, and score.
-
-    Example: {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
+    image_path: full path to the image file
+    image_id: integer ID assigned by external logic (must match ground truth)
     """
-    image_id = int(path.stem) if path.stem.isnumeric() else path.stem
-    box = xyxy2xywh(predn[:, :4])  # xywh
-    box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+    image_name = os.path.basename(image_path)  # e.g., 'set06_V000_I123.jpg'
+    box = xyxy2xywh(predn[:, :4])  # xywh format
+    box[:, :2] -= box[:, 2:] / 2  # center x/y to top-left
+
     for p, b in zip(predn.tolist(), box.tolist()):
         if p[4] < 0.1:
             continue
-        jdict.append(
-            {
-                "image_name": image_id,
-                "image_id": int(index),
-                "category_id": class_map[int(p[5])],
-                "bbox": [round(x, 3) for x in b],
-                "score": round(p[4], 5),
-            }
-        )
+        jdict.append({
+            "image_name": str(image_name),
+            "image_id": int(image_id),  # <- 여기!
+            "category_id": int(class_map[int(p[5])]),  # <- 여기!
+            "bbox": [round(float(x), 3) for x in b],  # <- 여기도!
+            "score": round(float(p[4]), 5),  # <- 여기도!
+        })
+
 
 
 def process_batch(detections, labels, iouv):
@@ -112,7 +127,6 @@ def process_batch(detections, labels, iouv):
             if x[0].shape[0] > 1:
                 matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                # matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
             correct[matches[:, 1].astype(int), i] = True
     return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
@@ -149,6 +163,7 @@ def run(
     callbacks=Callbacks(),
     compute_loss=None,
     epoch=None,
+    rgbt=False,  # RGB-T multispectral input
 ):
     # Initialize/load model and set device
     training = model is not None
@@ -163,16 +178,68 @@ def run(
         save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
         (save_dir / "labels" if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
-        # Load model
-        model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
-        stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
+        # RGB-T 모델 로딩 처리
+        if rgbt:
+            # RGB-T 모델의 경우 DetectMultiBackend 대신 직접 로딩
+            from models.yolo import Model
+            
+            LOGGER.info("🔥 RGB-T mode: Loading model directly (bypassing DetectMultiBackend)")
+            
+            # 체크포인트 로드
+            weights_path = weights[0] if isinstance(weights, list) else weights
+            ckpt = torch.load(weights_path, map_location='cpu')
+            
+            # 데이터셋 정보 로드
+            data_dict = check_dataset(data)
+            nc = 1 if single_cls else int(data_dict["nc"])
+            
+            # 모델 생성
+            if 'model' in ckpt and hasattr(ckpt['model'], 'yaml'):
+                model_yaml = ckpt['model'].yaml
+                LOGGER.info(f"✅ Using model YAML from checkpoint")
+            else:
+                # 기본 RGB-T 모델 구조 파일 사용
+                model_yaml = ROOT / "models/yolov5s_kaist-rgbt.yaml"
+                if not model_yaml.exists():
+                    LOGGER.warning(f"RGB-T config not found at {model_yaml}, using default yolov5s.yaml")
+                    model_yaml = ROOT / "models/yolov5s.yaml"
+                LOGGER.info(f"🔧 Using model config: {model_yaml}")
+            
+            model = Model(model_yaml, ch=3, nc=nc).to(device)
+            
+            # 가중치 로드
+            state_dict = ckpt['model'].float().state_dict() if 'model' in ckpt else ckpt
+            model.load_state_dict(state_dict, strict=False)
+            
+            # 모델 속성 설정 (DetectMultiBackend와 호환성을 위해)
+            model.stride = max(int(model.stride.max()), 32)
+            model.names = data_dict.get('names', {i: f'class{i}' for i in range(nc)})
+            model.pt = True
+            
+            stride, pt, jit, engine = model.stride, True, False, False
+            
+            LOGGER.info(f"✅ RGB-T model loaded: {len(state_dict):,} parameters")
+            
+        else:
+            # 기존 DetectMultiBackend 사용 (RGB 전용)
+            model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
+            stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
+            
         imgsz = check_img_size(imgsz, s=stride)  # check image size
-        half = model.fp16  # FP16 supported on limited backends with CUDA
-        if engine:
+        
+        # Half precision 설정
+        if rgbt:
+            half = half and device.type != 'cpu'
+            if half:
+                model.half()
+                LOGGER.info("🔥 RGB-T model using FP16")
+        else:
+            half = model.fp16  # FP16 supported on limited backends with CUDA
+        
+        if engine and not rgbt:
             batch_size = model.batch_size
         else:
-            device = model.device
-            if not (pt or jit):
+            if not rgbt and not (pt or jit):
                 batch_size = 1  # export.py models default to batch-size 1
                 LOGGER.info(f"Forcing --batch-size 1 square inference (1,3,{imgsz},{imgsz}) for non-PyTorch models")
 
@@ -189,16 +256,39 @@ def run(
 
     # Dataloader
     if not training:
-        if pt and not single_cls:  # check --weights are trained on --data
-            ncm = model.model.nc
+        # 클래스 수 검증 (RGB-T가 아닌 경우만)
+        if not rgbt and pt and not single_cls:  # check --weights are trained on --data
+            ncm = model.model.nc if hasattr(model, 'model') else getattr(model, 'nc', nc)
             assert ncm == nc, (
                 f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
                 f"classes). Pass correct combination of --weights and --data that are trained together."
             )
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
-        pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
+        
+        # 모델 웜업 처리
+        if rgbt:
+            # RGB-T 모델 웜업
+            LOGGER.info("🔥 Warming up RGB-T model...")
+            dummy_rgb = torch.zeros(1 if pt else batch_size, 3, imgsz, imgsz, device=device)
+            dummy_thermal = torch.zeros(1 if pt else batch_size, 3, imgsz, imgsz, device=device)
+            if half:
+                dummy_rgb, dummy_thermal = dummy_rgb.half(), dummy_thermal.half()
+            
+            try:
+                _ = model([dummy_rgb, dummy_thermal])
+                LOGGER.info("✅ RGB-T model warmup completed")
+            except Exception as e:
+                LOGGER.warning(f"⚠️ RGB-T model warmup failed: {e}")
+        else:
+            # 기존 웜업 방식
+            model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
+        
+        # 데이터로더 설정
+        pad, rect = (0.0, False) if task == "speed" else (0.5, False if rgbt else pt)  # RGB-T에서는 rect=False
         task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
-        dataloader = create_dataloader(
+        
+        LOGGER.info(f"📂 Loading {task} dataset: {data[task]}")
+        
+        dataloader, dataset = create_dataloader(
             data[task],
             imgsz,
             batch_size,
@@ -206,9 +296,24 @@ def run(
             single_cls,
             pad=pad,
             rect=rect,
-            workers=workers,
+            workers=workers if not rgbt else 0,  # RGB-T에서는 workers=0 권장
             prefix=colorstr(f"{task}: "),
-        )[0]
+            rgbt_input=rgbt,  # RGB-T 입력 활성화
+        )
+    if not hasattr(dataset, "im_files"):
+        raise AttributeError("dataset has no attribute 'im_files'")
+
+    image_id_map = {}
+    for idx, p in enumerate(dataset.im_files):
+        # RGB-T일 경우 p 는 (rgb_path, thermal_path) 튜플
+        if isinstance(p, (list, tuple)):
+            image_name = os.path.basename(p[0])  # GT와 같은 파일(보통 RGB)을 선택
+        else:
+            image_name = os.path.basename(p)
+        image_id_map[image_name] = idx
+
+    LOGGER.info(f"✅ Built image_id_map with {len(image_id_map)} entries")
+# ────────────────────────────────────────────────────────────────────
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
@@ -257,7 +362,7 @@ def run(
             )
 
         if isinstance(ims, list):
-            ims = ims[0]    # thermal image
+            ims = ims[0]    # thermal image for visualization
 
         # Metrics
         for si, pred in enumerate(preds):
@@ -296,7 +401,10 @@ def run(
                 (save_dir / "labels").mkdir(parents=True, exist_ok=True)
                 save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
             if save_json:
-                save_one_json(predn, jdict, path, index, class_map)  # append to COCO-JSON dictionary
+                image_name = os.path.basename(str(path))          # 'set06_V000_I123.jpg'
+                image_id  = image_id_map.get(image_name, index)   # 매핑 없으면 fallback=index
+                save_one_json(predn, jdict, path, image_id, class_map)
+
             callbacks.run("on_val_image_end", pred, predn, path, names, ims[si])
 
         # Plot images
@@ -349,21 +457,44 @@ def run(
             w = f'epoch{epoch}'
 
         pred_json = str(save_dir / f"{w}_predictions.json")  # predictions
-        LOGGER.info(f"\nSaving {pred_json}...")
+        LOGGER.info(f"\n💾 Saving {pred_json}...")
 
         with open(pred_json, "w") as f:
             json.dump(jdict, f, indent=2)
 
-        LOGGER.info(f"\nEvaluating mAP...")
+        LOGGER.info(f"✅ Saved {len(jdict)} predictions to {pred_json}")
 
-        # Run evaluation: KAIST Multispectral Pedestrian Dataset
-        try:
-            # HACK: need to generate KAIST_annotation.json for your own validation set
-            # if not os.path.exists('utils/eval/KAIST_val-D_annotation.json'):
-            #     raise FileNotFoundError('Please generate KAIST_annotation.json for your own validation set. (See utils/eval/generate_kaist_ann_json.py)')
-            os.system(f"python3 utils/eval/kaisteval.py --annFile /home/yewon/project/AUE8088/utils/eval/KAIST_annotation.json --rstFile {pred_json}")
-        except Exception as e:
-            LOGGER.info(f"kaisteval unable to run: {e}")
+        # KAIST evaluation
+        if rgbt:
+            LOGGER.info(f"🔍 Evaluating KAIST RGB-T results...")
+            try:
+                # KAIST annotation 파일 경로들 시도
+                kaist_ann_paths = [
+                    'datasets/kaist-rgbt/KAIST_val_annotation.json',
+                    'utils/eval/KAIST_val-D_annotation.json',
+                    'utils/eval/KAIST_test_annotation.json',
+                    'KAIST_annotation.json'
+                ]
+                
+                kaist_ann_file = None
+                for ann_path in kaist_ann_paths:
+                    if os.path.exists(ann_path):
+                        kaist_ann_file = ann_path
+                        break
+                
+                if kaist_ann_file:
+                    eval_command = f"python utils/eval/kaisteval.py --annFile {kaist_ann_file} --rstFile {pred_json}"
+                    LOGGER.info(f"🚀 Running KAIST evaluation: {eval_command}")
+                    result = os.system(eval_command)
+                    if result == 0:
+                        LOGGER.info("✅ KAIST evaluation completed successfully")
+                    else:
+                        LOGGER.warning("⚠️ KAIST evaluation completed with warnings")
+                else:
+                    LOGGER.warning("⚠️ KAIST annotation file not found. Please generate it using utils/eval/generate_kaist_ann_json.py")
+                    
+            except Exception as e:
+                LOGGER.info(f"⚠️ KAIST evaluation failed: {e}")
 
     # Return results
     model.float()  # for training
@@ -401,6 +532,8 @@ def parse_opt():
     parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
+    parser.add_argument("--rgbt", action="store_true", help="Feed RGB-T multispectral image pair.")  # RGB-T 모드
+    
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith("coco.yaml")
@@ -413,6 +546,11 @@ def main(opt):
     """Executes YOLOv5 tasks like training, validation, testing, speed, and study benchmarks based on provided
     options.
     """
+    # RGB-T 모드 정보 출력
+    if opt.rgbt:
+        LOGGER.info("🔥" * 20)
+        LOGGER.info("🔥 RGB-T MODE ACTIVATED")
+        LOGGER.info("🔥" * 20)
 
     if opt.task in ("train", "val", "test"):  # run normally
         if opt.conf_thres > 0.001:  # https://github.com/ultralytics/yolov5/issues/1466

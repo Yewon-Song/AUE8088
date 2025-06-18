@@ -69,24 +69,60 @@ def save_one_txt(predn, save_conf, shape, file):
             f.write(("%g " * len(line)).rstrip() % line + "\n")
 
 
+# KAIST 데이터셋 이미지 ID 매핑을 위한 전역 변수
+kaist_img_id_map = {}
+
+def load_kaist_img_id_map(ann_file='/home/yewon/project/AUE8088/utils/KAIST_val-D_annotation.json'):
+    """
+    KAIST 데이터셋 annotation 파일에서 이미지 이름과 ID 매핑을 로드
+    """
+    global kaist_img_id_map
+    if not kaist_img_id_map:
+        try:
+            with open(ann_file, 'r') as f:
+                data = json.load(f)
+                for img in data.get('images', []):
+                    # 이미지 파일명에서 확장자를 제거하고 ID와 매핑
+                    img_name = Path(img.get('im_name', '')).stem
+                    kaist_img_id_map[img_name] = img.get('id')
+            print(f"성공적으로 {len(kaist_img_id_map)} 개의 KAIST 이미지 ID 매핑을 로드했습니다.")
+        except Exception as e:
+            print(f"이미지 ID 매핑 로드 중 오류 발생: {e}")
+    return kaist_img_id_map
+
 def save_one_json(predn, jdict, path, index, class_map):
     """
     Saves one JSON detection result with image ID, category ID, bounding box, and score.
 
     Example: {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
     """
-    image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+    # KAIST 데이터셋에 맞게 image_id 추출 및 매핑
+    image_name = path.stem
+    
+    # KAIST 이미지 ID 매핑 로드
+    img_id_map = load_kaist_img_id_map()
+    
+    # 이미지 이름으로 ID 찾기
+    if image_name in img_id_map:
+        image_id = img_id_map[image_name]
+        # print(f"매핑 성공: {image_name} -> ID {image_id}")
+    else:
+        # 매핑을 찾을 수 없는 경우 기본값 사용
+        image_id = index
+        print(f"경고: {image_name} 이미지의 ID 매핑을 찾을 수 없습니다. 기본값 {index} 사용")
+    
     box = xyxy2xywh(predn[:, :4])  # xywh
     box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+    
     for p, b in zip(predn.tolist(), box.tolist()):
         if p[4] < 0.1:
             continue
         jdict.append(
             {
-                "image_name": image_id,
-                "image_id": int(index),
+                "image_name": image_name,
+                "image_id": image_id,  # KAIST 데이터셋과 일치하는 ID 사용
                 "category_id": class_map[int(p[5])],
-                "bbox": [round(x, 3) for x in b],
+                "bbox": [round(x, 3) for x in b],  # [x, y, width, height] 형식
                 "score": round(p[4], 5),
             }
         )
@@ -122,7 +158,7 @@ def process_batch(detections, labels, iouv):
 def run(
     data,
     weights=None,  # model.pt path(s)
-    batch_size=32,  # batch size
+    batch_size=12,  # batch size
     imgsz=640,  # inference size (pixels)
     conf_thres=0.001,  # confidence threshold
     iou_thres=0.6,  # NMS IoU threshold
@@ -142,6 +178,7 @@ def run(
     exist_ok=False,  # existing project/name ok, do not increment
     half=True,  # use FP16 half-precision inference
     dnn=False,  # use OpenCV DNN for ONNX inference
+    rgbt_input=True,  # enable RGBT (RGB-Thermal) evaluation mode
     model=None,
     dataloader=None,
     save_dir=Path(""),
@@ -195,9 +232,19 @@ def run(
                 f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
                 f"classes). Pass correct combination of --weights and --data that are trained together."
             )
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
+        # Modify warmup for RGBT models if rgbt_input flag is enabled
+        if rgbt_input:
+            # Create dummy inputs for both RGB and Thermal images
+            dummy_rgb = torch.zeros((1 if pt else batch_size, 3, imgsz, imgsz), device=device)
+            dummy_thermal = torch.zeros((1 if pt else batch_size, 3, imgsz, imgsz), device=device)
+            # Warmup with both inputs
+            model.model([dummy_rgb, dummy_thermal])
+            LOGGER.info("RGBT mode enabled: Using both RGB and Thermal inputs")
+        else:
+            model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup for RGB only
         pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
         task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
+        # Create dataloader with RGBT option if enabled
         dataloader = create_dataloader(
             data[task],
             imgsz,
@@ -205,9 +252,10 @@ def run(
             stride,
             single_cls,
             pad=pad,
-            rect=rect,
+            rect=False,
             workers=workers,
             prefix=colorstr(f"{task}: "),
+            rgbt_input=rgbt_input  # Pass rgbt_input flag to dataloader
         )[0]
 
     seen = 0
@@ -227,12 +275,13 @@ def run(
     for batch_i, (ims, targets, paths, shapes, indices) in enumerate(pbar):
         callbacks.run("on_val_batch_start")
         with dt[0]:
-            if isinstance(ims, list):
-                ims = [im.to(device, non_blocking=True).float() / 255 for im in ims]    # For RGB-T input
+            # Handle RGBT inputs (both RGB and thermal images)
+            if isinstance(ims, list):  # For RGBT input
+                ims = [im.to(device, non_blocking=True).float() / 255 for im in ims]  # For RGB-T input
                 nb, _, height, width = ims[0].shape  # batch size, channels, height, width
                 if half:
                     ims = [im.half() for im in ims]
-            else:
+            else:  # Regular RGB input
                 ims = ims.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
                 nb, _, height, width = ims.shape  # batch size, channels, height, width
                 if half:
@@ -359,9 +408,9 @@ def run(
         # Run evaluation: KAIST Multispectral Pedestrian Dataset
         try:
             # HACK: need to generate KAIST_annotation.json for your own validation set
-            # if not os.path.exists('utils/eval/KAIST_val-D_annotation.json'):
-            #     raise FileNotFoundError('Please generate KAIST_annotation.json for your own validation set. (See utils/eval/generate_kaist_ann_json.py)')
-            os.system(f"python3 utils/eval/kaisteval.py --annFile /home/yewon/project/AUE8088/utils/eval/KAIST_annotation.json --rstFile {pred_json}")
+            if not os.path.exists('utils/eval/KAIST_val-D_annotation.json'):
+                raise FileNotFoundError('Please generate KAIST_val-D_annotation.json for your own validation set. (See utils/eval/generate_kaist_ann_json.py)')
+            os.system(f"python3 utils/eval/kaisteval.py --annFile utils/eval/KAIST_val-D_annotation.json --rstFile {pred_json}")
         except Exception as e:
             LOGGER.info(f"kaisteval unable to run: {e}")
 
@@ -392,6 +441,7 @@ def parse_opt():
     parser.add_argument("--single-cls", action="store_true", help="treat as single-class dataset")
     parser.add_argument("--augment", action="store_true", help="augmented inference")
     parser.add_argument("--verbose", action="store_true", help="report mAP by class")
+    parser.add_argument("--rgbt_input", action="store_true", help="enable RGBT (RGB-Thermal) evaluation mode")
     parser.add_argument("--save-txt", action="store_true", help="save results to *.txt")
     parser.add_argument("--save-hybrid", action="store_true", help="save label+prediction hybrid results to *.txt")
     parser.add_argument("--save-conf", action="store_true", help="save confidences in --save-txt labels")
